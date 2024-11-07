@@ -46,24 +46,31 @@ class DatasetRTSD(torch.utils.data.Dataset):
         super().__init__()
         self.classes, self.class_to_idx = self.get_classes(path_to_classes_json)
         self.samples = []
-        for folder in root_folders:
-            class_idx = self.class_to_idx[os.path.basename(folder)]
-            for filename in os.listdir(folder):
-                img_path = os.path.join(folder, filename)
-                self.samples.append((img_path, class_idx))
+        for root_folder in root_folders:
+            for folder in os.listdir(root_folder):
+                class_idx = self.class_to_idx[folder]
+                for filename in os.listdir(os.path.join(root_folder, folder)):
+                    img_path = os.path.join(root_folder, folder, filename)
+                    self.samples.append((img_path, class_idx))
         self.classes_to_samples = {}
         for class_idx in self.class_to_idx.values():
             self.classes_to_samples[class_idx] = [i for i, (_, idx) in enumerate(self.samples) if idx == class_idx]
-        ### YOUR CODE HERE - аугментации + нормализация + ToTensorV2
-        self.transform = torchvision.transforms.Compose(
-            torchvision.ToTensorV2(),
-        )
+        self.transform = A.Compose([
+            A.Resize(width=224, height=224),
+            A.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            ),
+            ToTensorV2(),
+        ])
 
     def __getitem__(self, index: int) -> typing.Tuple[torch.Tensor, str, int]:
         """
         Возвращает тройку: тензор с картинкой, путь до файла, номер класса файла (если нет разметки, то "-1").
         """
-        return (Image.open(self.samples[index][0]), self.samples[index][0], self.samples[index][1])
+        image = Image.open(self.samples[index][0])
+        image = self.transform(image=np.array(image))['image']
+        return (image, self.samples[index][0], self.samples[index][1])
 
     @staticmethod
     def get_classes(
@@ -76,8 +83,8 @@ class DatasetRTSD(torch.utils.data.Dataset):
         """
         with open(path_to_classes_json, 'r') as json_file:
             json_dict = json.load(json_file)
-        class_to_idx = {class_name: json_dict[class_name]["idx"] for class_name in json_dict}
-        classes = {class_idx: class_name for class_name, class_idx in class_to_idx.items()}
+        class_to_idx = {class_name: json_dict[class_name]["id"] for class_name in json_dict}
+        classes = list(class_to_idx.keys())
         return classes, class_to_idx
 
     def __len__(self) -> int:
@@ -105,25 +112,45 @@ class TestData(torch.utils.data.Dataset):
         super().__init__()
         self.root = root
         ### YOUR CODE HERE - список путей до картинок
-        self.samples = ...
+        self.samples = [filename for filename in os.listdir(root)]
         ### YOUR CODE HERE - преобразования: ресайз + нормализация + ToTensorV2
-        self.transform = ...
+        self.transform = A.Compose([
+            A.Resize(width=224, height=224),
+            A.Normalize(),
+            ToTensorV2(),
+        ])
         self.targets = None
         if annotations_file is not None:
             ### YOUR CODE HERE - словарь, targets[путь до картинки] = индекс класса
-            self.targets = ...
+            self.targets = {}
+            with open(annotations_file, 'r') as f:
+                reader = csv.reader(f)
+                next(reader)
+                for row in reader:
+                    filename, class_code = row
+                    # img_path = os.path.join(self.root, filename)
+                    self.targets[filename] = class_code
+
 
     def __getitem__(self, index: int) -> typing.Tuple[torch.Tensor, str, int]:
         """
         Возвращает тройку: тензор с картинкой, путь до файла, номер класса файла (если нет разметки, то "-1").
         """
-        ### YOUR CODE HERE
+        img_path = self.samples[index]
+        image = Image.open(os.path.join(self.root, img_path))
+        image = self.transform(image=np.array(image))['image']
+        target = None
+        if self.targets is not None:
+            target = self.targets.get(img_path, None)
+
+        return image, img_path, target if target is not None else -1
+
 
     def __len__(self) -> int:
         """
         Возвращает размер датасета (количество сэмплов).
         """
-        ### YOUR CODE HERE
+        return len(self.samples)
 
 
 class CustomNetwork(L.LightningModule):
@@ -142,14 +169,27 @@ class CustomNetwork(L.LightningModule):
         internal_features: int = 1024,
     ):
         super().__init__()
-        ### YOUR CODE HERE
+        self.features_criterion = features_criterion
+
+        base_model = torchvision.models.resnet50(pretrained=True)
+        num_features = base_model.fc.in_features
+
+        base_model.fc = torch.nn.Linear(num_features, internal_features)
+        self.backbone = base_model
+
+        self.classifier = torch.nn.Sequential(
+            torch.nn.ReLU(),
+            torch.nn.Linear(internal_features, CLASSES_CNT)
+        )
 
     def forward(self, x: torch.Tensor) -> typing.Tuple[torch.Tensor, torch.Tensor]:
         """
         Функция для прогона данных через нейронную сеть.
         Возвращает два тензора: внутреннее представление и логиты после слоя-классификатора.
         """
-        ### YOUR CODE HERE
+        features = self.backbone(x)
+        logits = self.classifier(features)
+        return features, logits
 
     def predict(self, x: torch.Tensor) -> np.ndarray:
         """
@@ -157,14 +197,59 @@ class CustomNetwork(L.LightningModule):
 
         :param x: батч с картинками
         """
-        return  ### YOUR CODE HERE
+        self.eval()
+        with torch.no_grad():
+            _, logits = self(x)
+            preds = torch.argmax(logits, dim=1)
+        return preds.cpu().numpy()
+
+    def training_step(self, batch, batch_idx):
+        """
+        Шаг обучения.
+        """
+        images, _, class_idxs = batch
+        features, logits = self(images)
+        targets = torch.nn.functional.one_hot(class_idxs, num_classes=CLASSES_CNT).to(torch.float32)
+        loss = torch.nn.CrossEntropyLoss()(logits, targets)
+
+        # Добавляем features loss, если он определен
+        if self.features_criterion is not None:
+            loss += self.features_criterion(features, targets)
+        return loss
+
+    def configure_optimizers(self):
+        """
+        Конфигурирование оптимизаторов.
+        """
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+        return optimizer
 
 
 def train_simple_classifier() -> torch.nn.Module:
     """
     Функция для обучения простого классификатора на исходных данных.
     """
-    ### YOUR CODE HERE
+    batch_size = 32
+    num_epochs = 10
+
+    here = os.path.dirname(os.path.realpath(__file__))
+    train_dataset = DatasetRTSD(
+        root_folders=[f"{here}/cropped-train"],
+        path_to_classes_json=f"{here}/classes.json",
+    )
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    model = CustomNetwork(internal_features=1024)
+
+    trainer = L.Trainer(
+        max_epochs=num_epochs,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,
+    )
+    trainer.fit(model, train_loader)
+
+    torch.save(model.state_dict(), 'simple_model.pth')
     return model
 
 
@@ -180,8 +265,32 @@ def apply_classifier(
     :param test_folder: путь до папки с тестовыми данными
     :param path_to_classes_json: путь до файла с информацией о классах classes.json
     """
-    ### YOUR CODE HERE - список словарей вида {'filename': 'имя файла', 'class': 'строка-название класса'}
-    results = ...
+    # Загружаем список всех классов
+    with open(path_to_classes_json, 'r') as f:
+        classes = json.load(f)
+
+    transform = A.Compose([
+        A.Resize(width=224, height=224),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+    # Пройдем по каждому изображению в тестовой папке для предсказания
+    results = []
+    for filename in os.listdir(test_folder):
+        filepath = os.path.join(test_folder, filename)
+        image = Image.open(filepath).convert('RGB')
+        image_tensor = transform(image).unsqueeze(0)  # Добавляем батч измерение
+
+        # Получаем предсказание
+        predicted_class_idx = model.predict(image_tensor)[0]
+        predicted_class = classes[predicted_class_idx]
+
+        results.append({
+            'filename': filename,
+            'class': predicted_class
+        })
+
     return results
 
 
@@ -198,8 +307,50 @@ def test_classifier(
     :param test_folder: путь до папки с тестовыми данными
     :param annotations_file: путь до .csv-файла с аннотациями (опциональный)
     """
-    ### YOUR CODE HERE
+    # Получаем предсказания по тестовым данным
+    predictions = apply_classifier(model, test_folder, 'classes.json')
+
+    # Читаем аннотации
+    gt_annotations = {}
+    with open(annotations_file, 'r') as f:
+        reader = csv.reader(f)
+        next(reader)
+        for row in reader:
+            filename, class_code = row
+            gt_annotations[filename] = class_code
+
+    # Подсчет метрик (Total accuracy, Rare recall, Frequent recall)
+    correct = 0
+    total_rare = 0
+    correct_rare = 0
+    total_freq = 0
+    correct_freq = 0
+
+    rare_classes = set([class_name for class_name, info in classes.items() if info["rare"]])
+
+    for pred in predictions:
+        filename = pred['filename']
+        pred_class = pred['class']
+        gt_class = gt_annotations[filename]
+
+        if pred_class == gt_class:
+            correct += 1
+
+        # Отдельно для редких и частых классов
+        if gt_class in rare_classes:
+            total_rare += 1
+            if pred_class == gt_class:
+                correct_rare += 1
+        else:
+            total_freq += 1
+            if pred_class == gt_class:
+                correct_freq += 1
+
+    total_acc = correct / len(gt_annotations)
+    rare_recall = correct_rare / total_rare if total_rare > 0 else 0
+    freq_recall = correct_freq / total_freq if total_freq > 0 else 0
     return total_acc, rare_recall, freq_recall
+
 
 
 class SignGenerator(object):
