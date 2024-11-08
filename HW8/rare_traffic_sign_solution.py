@@ -56,6 +56,11 @@ class DatasetRTSD(torch.utils.data.Dataset):
         for class_idx in self.class_to_idx.values():
             self.classes_to_samples[class_idx] = [i for i, (_, idx) in enumerate(self.samples) if idx == class_idx]
         self.transform = A.Compose([
+            A.HorizontalFlip(p=0.5),
+            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=10, val_shift_limit=10, p=0.5),
+            A.MotionBlur(blur_limit=3, p=0.2),
             A.Resize(width=224, height=224),
             A.Normalize(
                 mean=[0.485, 0.456, 0.406],
@@ -111,9 +116,7 @@ class TestData(torch.utils.data.Dataset):
     ) -> None:
         super().__init__()
         self.root = root
-        ### YOUR CODE HERE - список путей до картинок
         self.samples = [filename for filename in os.listdir(root)]
-        ### YOUR CODE HERE - преобразования: ресайз + нормализация + ToTensorV2
         self.transform = A.Compose([
             A.Resize(width=224, height=224),
             A.Normalize(),
@@ -121,15 +124,14 @@ class TestData(torch.utils.data.Dataset):
         ])
         self.targets = None
         if annotations_file is not None:
-            ### YOUR CODE HERE - словарь, targets[путь до картинки] = индекс класса
             self.targets = {}
+            _, class_to_idx = DatasetRTSD.get_classes(path_to_classes_json)
             with open(annotations_file, 'r') as f:
                 reader = csv.reader(f)
                 next(reader)
                 for row in reader:
                     filename, class_code = row
-                    # img_path = os.path.join(self.root, filename)
-                    self.targets[filename] = class_code
+                    self.targets[filename] = class_to_idx[class_code]
 
 
     def __getitem__(self, index: int) -> typing.Tuple[torch.Tensor, str, int]:
@@ -171,7 +173,7 @@ class CustomNetwork(L.LightningModule):
         super().__init__()
         self.features_criterion = features_criterion
 
-        base_model = torchvision.models.resnet50(pretrained=True)
+        base_model = torchvision.models.resnet50(weights='DEFAULT')
         num_features = base_model.fc.in_features
 
         base_model.fc = torch.nn.Linear(num_features, internal_features)
@@ -229,8 +231,8 @@ def train_simple_classifier() -> torch.nn.Module:
     """
     Функция для обучения простого классификатора на исходных данных.
     """
-    batch_size = 32
-    num_epochs = 10
+    batch_size = 128
+    num_epochs = 2
 
     here = os.path.dirname(os.path.realpath(__file__))
     train_dataset = DatasetRTSD(
@@ -265,30 +267,17 @@ def apply_classifier(
     :param test_folder: путь до папки с тестовыми данными
     :param path_to_classes_json: путь до файла с информацией о классах classes.json
     """
-    # Загружаем список всех классов
-    with open(path_to_classes_json, 'r') as f:
-        classes = json.load(f)
 
-    transform = A.Compose([
-        A.Resize(width=224, height=224),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
-
-    # Пройдем по каждому изображению в тестовой папке для предсказания
+    root_images_dataset = TestData(test_folder, path_to_classes_json)
     results = []
-    for filename in os.listdir(test_folder):
-        filepath = os.path.join(test_folder, filename)
-        image = Image.open(filepath).convert('RGB')
-        image_tensor = transform(image).unsqueeze(0)  # Добавляем батч измерение
 
-        # Получаем предсказание
-        predicted_class_idx = model.predict(image_tensor)[0]
-        predicted_class = classes[predicted_class_idx]
-
+    for i in range(len(root_images_dataset)):
+        image_tensor, image_path = root_images_dataset[i][:2]
+        predicted_class_idx = model.predict(image_tensor.unsqueeze(0))[0]
+        classes, _ = DatasetRTSD.get_classes(path_to_classes_json)
         results.append({
-            'filename': filename,
-            'class': predicted_class
+            'filename': os.path.basename(image_path),
+            'class': classes[predicted_class_idx],
         })
 
     return results
@@ -307,17 +296,9 @@ def test_classifier(
     :param test_folder: путь до папки с тестовыми данными
     :param annotations_file: путь до .csv-файла с аннотациями (опциональный)
     """
-    # Получаем предсказания по тестовым данным
-    predictions = apply_classifier(model, test_folder, 'classes.json')
 
-    # Читаем аннотации
-    gt_annotations = {}
-    with open(annotations_file, 'r') as f:
-        reader = csv.reader(f)
-        next(reader)
-        for row in reader:
-            filename, class_code = row
-            gt_annotations[filename] = class_code
+    preds = apply_classifier(model, test_folder, 'classes.json')
+    test_data = TestData(test_folder, 'classes.json', annotations_file)
 
     # Подсчет метрик (Total accuracy, Rare recall, Frequent recall)
     correct = 0
@@ -326,27 +307,34 @@ def test_classifier(
     total_freq = 0
     correct_freq = 0
 
-    rare_classes = set([class_name for class_name, info in classes.items() if info["rare"]])
+    with open('classes.json', "r") as fr:
+        classes_info = json.load(fr)
+    rare_classes_images = set([filename for filename in classes_info if classes_info[filename]["type"] == 'rare'])
 
-    for pred in predictions:
-        filename = pred['filename']
-        pred_class = pred['class']
-        gt_class = gt_annotations[filename]
+    classes, class_to_idx = DatasetRTSD.get_classes('classes.json')
 
-        if pred_class == gt_class:
+    for i in range(len(test_data)):
+        image_tensor, image_path, image_class_idx = test_data[i][:3]
+        image_filename = os.path.basename(image_path)
+
+        # print(preds[i]['filename'], test_data[i][1])
+        # print(preds[i]['class'], image_class_idx)
+        # print(preds[i]['class'], classes[image_class_idx])
+        # print(class_to_idx[preds[i]['class']], image_class_idx)
+        # print()
+        if class_to_idx[preds[i]['class']] == image_class_idx:
             correct += 1
 
-        # Отдельно для редких и частых классов
-        if gt_class in rare_classes:
+        if image_filename in rare_classes_images:
             total_rare += 1
-            if pred_class == gt_class:
+            if preds[i] == image_class_idx:
                 correct_rare += 1
         else:
             total_freq += 1
-            if pred_class == gt_class:
+            if preds[i] == image_class_idx:
                 correct_freq += 1
 
-    total_acc = correct / len(gt_annotations)
+    total_acc = correct / len(test_data)
     rare_recall = correct_rare / total_rare if total_rare > 0 else 0
     freq_recall = correct_freq / total_freq if total_freq > 0 else 0
     return total_acc, rare_recall, freq_recall
